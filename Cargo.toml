@@ -1,0 +1,34 @@
+[package]
+name = "candle-examples-moondream"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.95"
+clap = { version = "4.5.29", features = ["derive"] }
+candle = { version = "0.8.3", package = "candle-core" }
+candle-nn = "0.8.3"
+candle-transformers = "0.8.3"
+tokenizers = "0.21.0"
+hf-hub = "0.4.1"
+
+# optional dependencies for hardware acceleration
+accelerate-src = { version = "0.3.2", optional = true }
+intel-mkl-src = { version = "0.8.1", optional = true, features = [
+    "mkl-static-lp64-iomp",
+] }
+
+[features]
+default = []
+accelerate = [
+    "accelerate-src",
+    "candle/accelerate",
+    "candle-nn/accelerate",
+    "candle-transformers/accelerate",
+]
+mkl = [
+    "intel-mkl-src",
+    "candle/mkl",
+    "candle-nn/mkl",
+    "candle-transformers/mkl",
+]
