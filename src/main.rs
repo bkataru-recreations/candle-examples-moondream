@@ -7,13 +7,19 @@ extern crate accelerate_src;
 use anyhow::{Error as E, Result};
 use clap::Parser;
 
-use candle::{DType, Device, Tensor};
+use candle::{
+    utils::{cuda_is_available, metal_is_available},
+    DType, Device, Tensor,
+};
 use candle_nn::VarBuilder;
 use candle_transformers::{
     generation::LogitsProcessor,
     models::{moondream, quantized_moondream},
 };
 use tokenizers::Tokenizer;
+
+// import image crate
+use image;
 
 enum Model {
     Moondream(moondream::Model),
@@ -81,10 +87,310 @@ impl TextGeneration {
         };
         let (bos_token, eos_token) = (special_token, special_token);
 
+        let start_gen = std::time::Instant::now();
+        let mut load_t = std::time::Duration::from_secs_f64(0f64);
+
+        for index in 0..sample_len {
+            let context_size = if index > 0 { 1 } else { tokens.len() };
+            let ctxt = &tokens[tokens.len().saturating_sub(context_size)..];
+            let input = Tensor::new(ctxt, &self.device)?.unsqueeze(0)?;
+
+            let logits = if index > 0 {
+                match self.model {
+                    Model::Moondream(ref mut model) => model.text_model.forward(&input)?,
+                    Model::Quantized(ref mut model) => model.text_model.forward(&input)?,
+                }
+            } else {
+                let bos_token = Tensor::new(&[bos_token], &self.device)?.unsqueeze(0)?;
+                let logits = match self.model {
+                    Model::Moondream(ref mut model) => {
+                        model
+                            .text_model
+                            .forward_with_img(&bos_token, &input, image_embeds)?
+                    }
+                    Model::Quantized(ref mut model) => {
+                        model
+                            .text_model
+                            .forward_with_img(&bos_token, &input, image_embeds)?
+                    }
+                };
+
+                load_t = start_gen.elapsed();
+                println!("load_t: {:?}", load_t);
+                logits
+            };
+
+            let logits = logits.squeeze(0)?.to_dtype(DType::F32)?;
+            let logits = if self.repeat_penalty == 1. {
+                logits
+            } else {
+                let start_at = tokens.len().saturating_sub(self.repeat_last_n);
+                candle_transformers::utils::apply_repeat_penalty(
+                    &logits,
+                    self.repeat_penalty,
+                    &tokens[start_at..],
+                )?
+            };
+
+            let next_token = self.logits_processor.sample(&logits)?;
+            tokens.push(next_token);
+
+            generated_tokens += 1;
+            if next_token == eos_token || tokens.ends_with(&[27, 10619, 29] /* <END> */) {
+                break;
+            }
+
+            let token = self.tokenizer.decode(&[next_token], true).map_err(E::msg)?;
+            print!("{token}");
+            std::io::stdout().flush()?;
+        }
+
+        let dt = start_gen.elapsed() - load_t;
+        println!(
+            "\ngenerated in {} seconds\n{generated_tokens} tokens generated ({:.2} token/s)",
+            dt.as_secs_f64(),
+            (generated_tokens - 1) as f64 / dt.as_secs_f64()
+        );
+
         Ok(())
     }
 }
 
-fn main() {
-    println!("Hello, world!");
+#[derive(Parser)]
+struct Args {
+    /// run on CPU rather than on GPU
+    #[arg(long)]
+    cpu: bool,
+
+    /// enable tracing (generates a trace-timestamp.json file)
+    #[arg(long)]
+    tracing: bool,
+
+    /// display the token for the specified prompt
+    #[arg(long)]
+    verbose_prompt: bool,
+
+    #[arg(long)]
+    prompt: String,
+
+    #[arg(long)]
+    image: String,
+
+    /// the temperature used to generate samples
+    #[arg(long)]
+    temperature: Option<f64>,
+
+    /// nucleus sampling probability cutoff
+    #[arg(long)]
+    top_p: Option<f64>,
+
+    /// the seed to use when generating random samples
+    #[arg(long, default_value_t = 0)]
+    seed: u64,
+
+    #[arg(long, default_value_t = 5000)]
+    sample_len: usize,
+
+    /// penalty to be applied for repeating tokens, 1.0 -> no penalty
+    #[arg(long, default_value_t = 1.0)]
+    repeat_penalty: f32,
+
+    /// the context size to consider for the repeat penalty
+    #[arg(long, default_value_t = 64)]
+    repeat_last_n: usize,
+
+    #[arg(long)]
+    model_id: Option<String>,
+
+    #[arg(long)]
+    revision: Option<String>,
+
+    #[arg(long)]
+    quantized: bool,
+
+    /// use f16 precision for all computations instead of f32
+    #[arg(long)]
+    f16: bool,
+
+    #[arg(long)]
+    model_file: Option<String>,
+
+    #[arg(long)]
+    tokenizer_file: Option<String>,
+}
+
+pub fn device(cpu: bool) -> Result<Device> {
+    println!("{}", cuda_is_available());
+    if cpu {
+        Ok(Device::Cpu)
+    } else if cuda_is_available() {
+        Ok(Device::new_cuda(0)?)
+    } else if metal_is_available() {
+        Ok(Device::new_metal(0)?)
+    } else {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            eprintln!("running on CPU, to run on GPU (metal), build with `--features metal`");
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            println!("running on CPU, to run on GPU, build with `--features cuda`");
+        }
+        Ok(Device::Cpu)
+    }
+}
+
+/// loads an image from disk using the image crate, this returns a tensor with shape
+/// (3, 378, 378)
+pub fn load_image<P: AsRef<std::path::Path>>(p: P) -> candle::Result<Tensor> {
+    let img = image::ImageReader::open(p)?
+        .decode()
+        .map_err(candle::Error::wrap)?
+        .resize_to_fill(378, 378, image::imageops::FilterType::Triangle); // adjusted to 378x378
+
+    let img = img.to_rgb8();
+    let data = img.into_raw();
+    let data = Tensor::from_vec(data, (378, 378, 3), &Device::Cpu)?.permute((2, 0, 1))?;
+    let mean = Tensor::new(&[0.5_f32, 0.5, 0.5], &Device::Cpu)?.reshape((3, 1, 1))?;
+    let std = Tensor::new(&[0.5_f32, 0.5, 0.5], &Device::Cpu)?.reshape((3, 1, 1))?;
+
+    (data.to_dtype(candle::DType::F32)? / 255.)?
+        .broadcast_sub(&mean)?
+        .broadcast_div(&std)
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    use tracing_chrome::ChromeLayerBuilder;
+    use tracing_subscriber::prelude::*;
+
+    let args = Args::parse();
+
+    let _guard = if args.tracing {
+        let (chrome_layer, guard) = ChromeLayerBuilder::new().build();
+        tracing_subscriber::registry().with(chrome_layer).init();
+        Some(guard)
+    } else {
+        None
+    };
+
+    println!(
+        "avx: {}, neon: {}, simd128: {}, f16c: {}",
+        candle::utils::with_avx(),
+        candle::utils::with_neon(),
+        candle::utils::with_simd128(),
+        candle::utils::with_f16c()
+    );
+
+    println!(
+        "temp: {:.2} repeat-penalty: {:.2} repeat-last-n: {}",
+        args.temperature.unwrap_or(0.),
+        args.repeat_penalty,
+        args.repeat_last_n
+    );
+
+    let start = std::time::Instant::now();
+    let api = hf_hub::api::tokio::Api::new()?;
+
+    let (model_id, revision) = match args.model_id {
+        Some(model_id) => (model_id.to_string(), None),
+        None => {
+            if args.quantized {
+                ("santiagomed/candle-moondream".to_string(), None)
+            } else {
+                (
+                    "vikhyatk/candle-moondream".to_string(),
+                    Some("f6e9da68e8f1b78b8f3ee10905d56826db7a5802"),
+                )
+            }
+        }
+    };
+
+    let revision = match (args.revision, revision) {
+        (Some(r), _) => r,
+        (None, Some(r)) => r.to_string(),
+        (None, None) => "main".to_string(),
+    };
+
+    let repo = api.repo(hf_hub::Repo::with_revision(
+        model_id,
+        hf_hub::RepoType::Model,
+        revision,
+    ));
+
+    let model_name = match args.model_file {
+        Some(m) => m.into(),
+        None => {
+            if args.quantized {
+                repo.get("model-q4_0.gguf").await?
+            } else {
+                repo.get("model.safetensors").await?
+            }
+        }
+    };
+    let tokenizer = match args.tokenizer_file {
+        Some(m) => m.into(),
+        None => repo.get("tokenizer.json").await?,
+    };
+
+    println!("retrieved the files in {:?}", start.elapsed());
+    let tokenizer = Tokenizer::from_file(tokenizer).map_err(E::msg)?;
+
+    println!("device: {}", args.cpu);
+
+    let start = std::time::Instant::now();
+    let device = device(args.cpu)?;
+    let config = moondream::Config::v2();
+    let dtype = if args.quantized {
+        if args.f16 {
+            anyhow::bail!("quantized model does not support f16");
+        }
+        DType::F32
+    } else {
+        DType::F32
+    };
+
+    let model = if args.quantized {
+        let vb = candle_transformers::quantized_var_builder::VarBuilder::from_gguf(
+            &model_name,
+            &device,
+        )?;
+        let model = quantized_moondream::Model::new(&config, vb)?;
+        Model::Quantized(model)
+    } else {
+        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[model_name], dtype, &device)? };
+        let model = moondream::Model::new(&config, vb)?;
+        Model::Moondream(model)
+    };
+    println!("loaded the model in {:?}", start.elapsed());
+
+    let start = std::time::Instant::now();
+    let image = load_image(args.image)?
+        .to_device(&device)?
+        .to_dtype(dtype)?;
+    let image_embeds = image.unsqueeze(0)?;
+    let image_embeds = match model {
+        Model::Moondream(ref m) => image_embeds.apply(m.vision_encoder())?,
+        Model::Quantized(ref m) => image_embeds.apply(m.vision_encoder())?,
+    };
+    println!(
+        "loaded and encoded the image {image:?} in {:?}",
+        start.elapsed()
+    );
+
+    let prompt = format!("\n\nQuestion: {0}\n\nAnswer:", args.prompt);
+    let mut pipeline = TextGeneration::new(
+        model,
+        tokenizer,
+        args.seed,
+        args.temperature,
+        args.top_p,
+        args.repeat_penalty,
+        args.repeat_last_n,
+        args.verbose_prompt,
+        &device,
+    );
+    pipeline.run(&prompt, &image_embeds, args.sample_len)?;
+
+    Ok(())
 }
